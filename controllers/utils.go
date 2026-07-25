@@ -384,7 +384,14 @@ func updateClassifierReportDeploymentStatus(ctx context.Context, c client.Client
 	return c.Status().Patch(ctx, report, patch)
 }
 
-// updateClassifierReportLabelStatus patches ClassifierReport.Status with label management data.
+// updateClassifierReportLabelStatus patches ClassifierReport.Status with label management data,
+// and marks the report Processed. This runs for every matching/non-matching cluster on every
+// reconcile, regardless of ClassifierReportMode, so it is what actually closes WaitingForDelivery
+// -> Processed for AgentSendReportsNoGateway (send-reports) mode: sveltos-agent pushes Spec
+// straight into this same report (by canonical name) but never touches Status, and collection's
+// own Processed-marking (processOneClassifierReport / processClassifierReportsForClusterInAgentlessMode)
+// never runs for that mode since collectClassifierReports is only started when
+// ClassifierReportMode == CollectFromManagementCluster.
 // Pass nil slices to clear the tracking when a cluster stops matching.
 func updateClassifierReportLabelStatus(ctx context.Context, c client.Client,
 	classifierName string, cluster *corev1.ObjectReference,
@@ -401,6 +408,8 @@ func updateClassifierReportLabelStatus(ctx context.Context, c client.Client,
 	patch := client.MergeFrom(report.DeepCopy())
 	report.Status.ManagedLabels = managed
 	report.Status.UnManagedLabels = unmanaged
+	processed := libsveltosv1beta1.ReportProcessed
+	report.Status.Phase = &processed
 	return c.Status().Patch(ctx, report, patch)
 }
 

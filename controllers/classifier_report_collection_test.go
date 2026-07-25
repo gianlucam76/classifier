@@ -18,6 +18,8 @@ package controllers_test
 
 import (
 	"context"
+	"fmt"
+	"strings"
 
 	"github.com/go-logr/logr"
 	. "github.com/onsi/ginkgo/v2"
@@ -270,6 +272,67 @@ var _ = Describe("Classifier Deployer", func() {
 		validateClassifierReports(classifierName, cluster, &clusterType)
 	})
 
+	It("processClassifierReportsForClusterInAgentlessMode marks the report Processed", func() {
+		cluster := prepareCluster()
+		clusterType := libsveltosv1beta1.ClusterTypeCapi
+
+		classifierName := randomString()
+		classifier := getClassifierInstance(classifierName)
+		Expect(testEnv.Create(context.TODO(), classifier)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv.Client, classifier)).To(Succeed())
+
+		// In agentless mode, sveltos-agent-in-mgmt-cluster writes the ClassifierReport directly
+		// in the management cluster, in the cluster's own namespace, with the cluster labels set.
+		waitingForDelivery := libsveltosv1beta1.ReportWaitingForDelivery
+		classifierReport := &libsveltosv1beta1.ClassifierReport{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: cluster.Namespace,
+				Name:      libsveltosv1beta1.GetClassifierReportName(classifierName, cluster.Name, &clusterType),
+				Labels:    libsveltosv1beta1.GetClassifierReportLabels(classifierName, cluster.Name, &clusterType),
+			},
+			Spec: libsveltosv1beta1.ClassifierReportSpec{
+				ClusterNamespace: cluster.Namespace,
+				ClusterName:      cluster.Name,
+				ClassifierName:   classifierName,
+				ClusterType:      clusterType,
+				Match:            true,
+			},
+		}
+		Expect(testEnv.Create(context.TODO(), classifierReport)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv.Client, classifierReport)).To(Succeed())
+
+		classifierReport.Status.Phase = &waitingForDelivery
+		Expect(testEnv.Status().Update(context.TODO(), classifierReport)).To(Succeed())
+
+		// In agentless mode, the sveltos-agent version ConfigMap lives in the cluster's own
+		// namespace, named "sa-<clusterType>-<clusterName>" (see libsveltos/lib/sveltos_upgrade).
+		agentVersionConfigMap := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: cluster.Namespace,
+				Name:      fmt.Sprintf("sa-%s-%s", strings.ToLower(string(clusterType)), cluster.Name),
+			},
+			Data: map[string]string{
+				classifierLabelVersion: version,
+			},
+		}
+		Expect(testEnv.Create(context.TODO(), agentVersionConfigMap)).To(Succeed())
+		Expect(waitForObject(context.TODO(), testEnv.Client, agentVersionConfigMap)).To(Succeed())
+
+		Expect(controllers.ProcessClassifierReportsForClusterInAgentlessMode(context.TODO(), testEnv.Client,
+			getClusterRef(cluster), []*libsveltosv1beta1.ClassifierReport{classifierReport}, version, logger)).To(Succeed())
+
+		Eventually(func() bool {
+			currentClassifierReport := &libsveltosv1beta1.ClassifierReport{}
+			err := testEnv.Get(context.TODO(),
+				types.NamespacedName{Namespace: classifierReport.Namespace, Name: classifierReport.Name},
+				currentClassifierReport)
+			if err != nil {
+				return false
+			}
+			return currentClassifierReport.Status.Phase != nil &&
+				*currentClassifierReport.Status.Phase == libsveltosv1beta1.ReportProcessed
+		}, timeout, pollingInterval).Should(BeTrue())
+	})
 })
 
 func validateClassifierReports(classifierName string, cluster *clusterv1.Cluster, clusterType *libsveltosv1beta1.ClusterType) {
@@ -295,6 +358,11 @@ func validateClassifierReports(classifierName string, cluster *clusterv1.Cluster
 			return false
 		}
 		v, ok := currentClassifierReport.Labels[libsveltosv1beta1.ClassifierlNameLabel]
-		return ok && v == classifierName
+		if !ok || v != classifierName {
+			return false
+		}
+
+		return currentClassifierReport.Status.Phase != nil &&
+			*currentClassifierReport.Status.Phase == libsveltosv1beta1.ReportProcessed
 	}, timeout, pollingInterval).Should(BeTrue())
 }

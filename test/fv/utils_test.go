@@ -91,8 +91,16 @@ func verifyClassfierIsProvisioned(classifier *libsveltosv1beta1.Classifier) {
 			types.NamespacedName{Namespace: currentCuster.GetNamespace(), Name: reportName}, report); err != nil {
 			return false
 		}
-		return report.Status.DeploymentStatus != nil &&
-			*report.Status.DeploymentStatus == libsveltosv1beta1.SveltosStatusProvisioned
+		if report.Status.DeploymentStatus == nil ||
+			*report.Status.DeploymentStatus != libsveltosv1beta1.SveltosStatusProvisioned {
+
+			return false
+		}
+
+		// Collection must have marked the report Processed; otherwise it is stuck at
+		// WaitingForDelivery/Delivering and was never actually picked up.
+		return report.Status.Phase != nil &&
+			*report.Status.Phase == libsveltosv1beta1.ReportProcessed
 	}, timeout, pollingInterval).Should(BeTrue())
 }
 
