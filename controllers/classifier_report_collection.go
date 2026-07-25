@@ -337,8 +337,14 @@ func processClassifierReportsForClusterInAgentlessMode(ctx context.Context, c cl
 			continue
 		}
 		l := logger.WithValues("classifierReport", cr.Name)
-		if err := updateClassifierReport(ctx, c, ref, cr, l); err != nil {
+		mgmtClassifierReport, err := updateClassifierReport(ctx, c, ref, cr, l)
+		if err != nil {
 			l.V(logs.LogInfo).Error(err, "failed to update ClassifierReport in management cluster")
+			retErr = err
+			continue
+		}
+
+		if err := updateClassifierReportStatus(ctx, c, mgmtClassifierReport, l); err != nil {
 			retErr = err
 		}
 	}
@@ -453,30 +459,47 @@ func collectClassifierReportsFromCluster(ctx context.Context, c client.Client,
 			continue
 		}
 
-		err = updateClassifierReport(ctx, c, cluster, cr, l)
-		if err != nil {
-			l.V(logs.LogInfo).Error(err, "failed to update EventReport in management cluster")
-			continue
-		}
+		processOneClassifierReport(ctx, c, clusterClient, cluster, cr, l)
 	}
 
 	return nil
 }
 
+// processOneClassifierReport updates cr's management-cluster copy and marks that copy Processed
+// (this is the object mcp-server/dashboard read to determine pipeline health), then also marks cr
+// itself Processed in the managed cluster, mirroring healthcheck-manager/event-manager. Split out
+// of collectClassifierReportsFromCluster to keep that function's cyclomatic complexity down.
+func processOneClassifierReport(ctx context.Context, c, clusterClient client.Client,
+	cluster *corev1.ObjectReference, cr *libsveltosv1beta1.ClassifierReport, logger logr.Logger) {
+
+	mgmtClassifierReport, err := updateClassifierReport(ctx, c, cluster, cr, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to update ClassifierReport in management cluster")
+		return
+	}
+
+	if err := updateClassifierReportStatus(ctx, c, mgmtClassifierReport, logger); err != nil {
+		return
+	}
+
+	_ = updateClassifierReportStatus(ctx, clusterClient, cr, logger)
+}
+
 func updateClassifierReport(ctx context.Context, c client.Client, cluster *corev1.ObjectReference,
-	classiferReport *libsveltosv1beta1.ClassifierReport, logger logr.Logger) error {
+	classiferReport *libsveltosv1beta1.ClassifierReport, logger logr.Logger,
+) (*libsveltosv1beta1.ClassifierReport, error) {
 
 	if classiferReport.Labels == nil {
 		msg := "classifierReport is malformed. Labels is empty"
 		logger.V(logs.LogInfo).Info(msg)
-		return errors.New(msg)
+		return nil, errors.New(msg)
 	}
 
 	classifierName, ok := classiferReport.Labels[libsveltosv1beta1.ClassifierlNameLabel]
 	if !ok {
 		msg := "classifierReport is malformed. Label missing"
 		logger.V(logs.LogInfo).Info(msg)
-		return errors.New(msg)
+		return nil, errors.New(msg)
 	}
 
 	// Verify Classifier still exists
@@ -484,12 +507,12 @@ func updateClassifierReport(ctx context.Context, c client.Client, cluster *corev
 	err := c.Get(ctx, types.NamespacedName{Name: classifierName}, &currentClassifier)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			return nil
+			return classiferReport, nil
 		}
-		return err
+		return nil, err
 	}
 	if !currentClassifier.DeletionTimestamp.IsZero() {
-		return nil
+		return classiferReport, nil
 	}
 
 	clusterType := clusterproxy.GetClusterType(cluster)
@@ -510,9 +533,12 @@ func updateClassifierReport(ctx context.Context, c client.Client, cluster *corev
 			currentClassifierReport.Spec.ClusterNamespace = cluster.Namespace
 			currentClassifierReport.Spec.ClusterName = cluster.Name
 			currentClassifierReport.Spec.ClusterType = clusterType
-			return c.Create(ctx, currentClassifierReport)
+			if err := c.Create(ctx, currentClassifierReport); err != nil {
+				return nil, err
+			}
+			return currentClassifierReport, nil
 		}
-		return err
+		return nil, err
 	}
 
 	logger.V(logs.LogDebug).Info("update ClassifierReport in management cluster")
@@ -522,5 +548,23 @@ func updateClassifierReport(ctx context.Context, c client.Client, cluster *corev
 	currentClassifierReport.Spec.ClusterType = clusterType
 	currentClassifierReport.Labels = libsveltosv1beta1.GetClassifierReportLabels(
 		classifierName, cluster.Name, &clusterType)
-	return c.Update(ctx, currentClassifierReport)
+	if err := c.Update(ctx, currentClassifierReport); err != nil {
+		return nil, err
+	}
+	return currentClassifierReport, nil
+}
+
+// updateClassifierReportStatus marks report Processed in the management cluster, mirroring
+// healthcheck-manager's/event-manager's HealthCheckReport/EventReport collection pattern so
+// ClassifierReport doesn't stay stuck at WaitingForDelivery once it has actually been collected.
+func updateClassifierReportStatus(ctx context.Context, c client.Client,
+	report *libsveltosv1beta1.ClassifierReport, logger logr.Logger) error {
+
+	phase := libsveltosv1beta1.ReportProcessed
+	report.Status.Phase = &phase
+	if err := c.Status().Update(ctx, report); err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to update ClassifierReport status")
+		return err
+	}
+	return nil
 }
