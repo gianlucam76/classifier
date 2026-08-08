@@ -21,6 +21,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"reflect"
+	"strings"
 
 	"github.com/go-logr/logr"
 	. "github.com/onsi/ginkgo/v2"
@@ -700,6 +701,77 @@ metadata:
 		controllers.SetSveltosAgentConfigMap("")
 
 		verifyPatches(patches)
+	})
+
+	It("getSveltosAgentPatches supports mixing legacy and structured patches in the same ConfigMap", func() {
+		sveltosCluster := &libsveltosv1beta1.SveltosCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: randomString(),
+				Name:      upstreamClusterNamePrefix + randomString(),
+			},
+		}
+
+		cmYAML := fmt.Sprintf(`apiVersion: v1
+data:
+  legacy-patch: |-
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: sveltos-agent-manager
+  structured-patch: |-
+    patch: |-
+      - op: add
+        path: /spec/template/spec/imagePullSecrets
+        value:
+        - name: registry-pull-secret
+kind: ConfigMap
+metadata:
+  name: sveltos-agent-config-mixed
+  namespace: %s`, sveltosNamespace)
+
+		cm, err := deployer.GetUnstructured([]byte(cmYAML), logger)
+		Expect(err).To(BeNil())
+
+		initObjects := []client.Object{sveltosCluster}
+		for i := range cm {
+			initObjects = append(initObjects, cm[i])
+		}
+
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(initObjects...).Build()
+
+		controllers.SetSveltosAgentConfigMap("sveltos-agent-config-mixed")
+		patches, err := controllers.GetSveltosAgentPatches(context.TODO(), c, sveltosCluster.Namespace,
+			sveltosCluster.Name, libsveltosv1beta1.ClusterTypeSveltos, logger)
+		Expect(err).To(BeNil())
+		Expect(len(patches)).To(Equal(2))
+		controllers.SetSveltosAgentConfigMap("")
+
+		// Both entries default to targeting Deployment/apps since neither ConfigMap key
+		// specifies a target.
+		for i := range patches {
+			Expect(patches[i].Target).ToNot(BeNil())
+			Expect(patches[i].Target.Kind).To(Equal("Deployment"))
+		}
+
+		// The structured entry must remain structured: its Patch field is the JSON6902
+		// document as-is, not re-wrapped in another "patch:" key.
+		foundStructured := false
+		for i := range patches {
+			if strings.Contains(patches[i].Patch, "op: add") {
+				foundStructured = true
+				Expect(patches[i].Patch).ToNot(ContainSubstring("patch: |-"))
+			}
+		}
+		Expect(foundStructured).To(BeTrue())
+
+		// The legacy entry must still be carried verbatim as the raw patch content.
+		foundLegacy := false
+		for i := range patches {
+			if strings.Contains(patches[i].Patch, "kind: Deployment") {
+				foundLegacy = true
+			}
+		}
+		Expect(foundLegacy).To(BeTrue())
 	})
 
 	It("getSveltosApplierPatches reads post render patches from ConfigMap", func() {
