@@ -62,7 +62,7 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
-        image: docker.io/projectsveltos/sveltos-agent@sha256:ad2cd7fc4b3a5116247380432a1469efa8c107d840670e9ed2bf5c08bb3668a1
+        image: docker.io/projectsveltos/sveltos-agent@sha256:eac7794b3b0f5c3c9654b995dd2a59813349e56490ef48d279e8f4fcb44a3740
         livenessProbe:
           failureThreshold: 3
           httpGet:
